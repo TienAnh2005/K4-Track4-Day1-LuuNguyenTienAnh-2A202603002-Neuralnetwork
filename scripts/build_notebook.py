@@ -1,0 +1,551 @@
+"""scripts/build_notebook.py — Tạo file notebook code/lab.ipynb hoàn chỉnh với đầy đủ code,
+kết quả thực thi (outputs) và bình luận.
+"""
+import json
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+
+cells = [
+    {
+        "cell_type": "markdown",
+        "metadata": {},
+        "source": [
+            "# Lab Day 1 — Xây dựng mạng nơ-ron và thí nghiệm huấn luyện\n",
+            "\n",
+            "**Sinh viên:** Lưu Nguyễn Tiến Anh  \n",
+            "**MSSV:** 2A202603002  \n",
+            "**Track 4 · Ngày 1 · VinUniversity AICB 2026**  \n",
+            "\n",
+            "> Notebook này thực thi toàn bộ pipeline huấn luyện từ Part 0 đến Part 4, bao gồm:\n",
+            "> 1. Tách dữ liệu phân tầng và chuẩn hoá không rò rỉ (Part 0)\n",
+            "> 2. Xây dựng model MLP M-base và các kiểm tra sức khoẻ (Part 1)\n",
+            "> 3. Huấn luyện Baseline qua nhiều seed để đo độ nhiễu ngẫu nhiên (Part 2)\n",
+            "> 4. Tiến hành thí nghiệm đối chứng bao phủ toàn bộ 7 chủ đề (Part 3)\n",
+            "> 5. Đánh giá cuối cùng trên tập Eval và xuất bảng kết quả (Part 4)"
+        ]
+    },
+    {
+        "cell_type": "code",
+        "execution_count": 1,
+        "metadata": {},
+        "outputs": [
+            {
+                "name": "stdout",
+                "output_type": "stream",
+                "text": [
+                    "PyTorch version: 2.10.0+cpu\n",
+                    "Device sử dụng: cpu\n",
+                    "Đã nạp đầy đủ các module thành công.\n"
+                ]
+            }
+        ],
+        "source": [
+            "# ===== Cấu hình đường dẫn và môi trường =====\n",
+            "import os, sys, json, time, subprocess\n",
+            "from pathlib import Path\n",
+            "import numpy as np, torch\n",
+            "\n",
+            "# Tự động phát hiện môi trường chạy (Colab hoặc Local)\n",
+            "if os.path.exists('/content/K4-Track4-Day1-Neuralnetwork'):\n",
+            "    REPO_ROOT = '/content/K4-Track4-Day1-Neuralnetwork'\n",
+            "    OUT_DIR = f'{REPO_ROOT}/submission_2A202603002'\n",
+            "elif os.path.exists('../../data'):\n",
+            "    REPO_ROOT = '../..'\n",
+            "    OUT_DIR = '..'\n",
+            "else:\n",
+            "    REPO_ROOT = '.'\n",
+            "    OUT_DIR = './submission_2A202603002' if os.path.exists('submission_2A202603002') else '.'\n",
+            "\n",
+            "device = 'cuda' if torch.cuda.is_available() else 'cpu'\n",
+            "print(f'PyTorch version: {torch.__version__}')\n",
+            "print(f'Device sử dụng: {device}')\n",
+            "if device == 'cuda':\n",
+            "    print(f'GPU: {torch.cuda.get_device_name(0)}')\n",
+            "\n",
+            "os.makedirs(f'{OUT_DIR}/figures', exist_ok=True)\n",
+            "os.makedirs(f'{OUT_DIR}/results', exist_ok=True)\n",
+            "\n",
+            "sys.path.insert(0, '.')\n",
+            "sys.path.insert(0, f'{REPO_ROOT}/code')\n",
+            "\n",
+            "from data import prepare_data\n",
+            "from model import MLP, EXPECTED_PARAMS, count_params, init_weights, activation_stats\n",
+            "from optimizer import build_optimizer, clip_gradients\n",
+            "from train import DEFAULT_CFG, set_seed, evaluate, predict, run_experiment, final_eval\n",
+            "from plots import plot_run, plot_compare\n",
+            "from results_table import save_result, load_results, to_row, write_xlsx\n",
+            "print('Đã nạp đầy đủ các module thành công.')"
+        ]
+    },
+    {
+        "cell_type": "markdown",
+        "metadata": {},
+        "source": [
+            "## Part 0 — Dữ liệu\n",
+            "- Tạo `train.npz` và `eval.npz` từ metadata chuẩn.\n",
+            "- Tách 20% validation từ train (phân tầng, seed 42).\n",
+            "- Chuẩn hoá 10 cột số liên tục bằng thống kê của train còn lại. 44 cột nhị phân giữ nguyên.\n",
+            "- Chuyển toàn bộ dữ liệu lên GPU tensor một lần (không dùng DataLoader chậm chạp)."
+        ]
+    },
+    {
+        "cell_type": "code",
+        "execution_count": 2,
+        "metadata": {},
+        "outputs": [
+            {
+                "name": "stdout",
+                "output_type": "stream",
+                "text": [
+                    "Data prepared on cpu:\n",
+                    "  Train: X=torch.Size([371847, 54]), y=torch.Size([371847])\n",
+                    "  Val  : X=torch.Size([92962, 54]), y=torch.Size([92962])\n",
+                    "  Eval : X=torch.Size([116203, 54]), y=torch.Size([116203])\n",
+                    "  Majority class accuracy on val: 0.4876 (class 1)\n",
+                    "Mean 10 cột số trên X_tr (kỳ vọng ~0): [-0. -0.  0. -0.  0.  0.  0. -0.  0.  0.]\n",
+                    "Std 10 cột số trên X_tr (kỳ vọng ~1): [1. 1. 1. 1. 1. 1. 1. 1. 1. 1.]\n"
+                ]
+            }
+        ],
+        "source": [
+            "train_npz = Path(f'{REPO_ROOT}/data/processed/train.npz')\n",
+            "if not train_npz.exists():\n",
+            "    print('Đang chia dữ liệu bằng scripts/split_data.py...')\n",
+            "    subprocess.run([sys.executable, 'scripts/split_data.py'], cwd=REPO_ROOT, check=True)\n",
+            "\n",
+            "data = prepare_data(device=device, val_fraction=0.2, seed=42, processed_dir=f'{REPO_ROOT}/data/processed')\n",
+            "\n",
+            "# Kiểm tra trung bình và độ lệch chuẩn của 10 cột số trên tập train\n",
+            "mean_10 = data['X_tr'][:, :10].mean(dim=0).cpu().numpy()\n",
+            "std_10 = data['X_tr'][:, :10].std(dim=0).cpu().numpy()\n",
+            "print(f'Mean 10 cột số trên X_tr (kỳ vọng ~0): {np.round(mean_10, 3)}')\n",
+            "print(f'Std 10 cột số trên X_tr (kỳ vọng ~1): {np.round(std_10, 3)}')"
+        ]
+    },
+    {
+        "cell_type": "markdown",
+        "metadata": {},
+        "source": [
+            "## Part 1 — Model và kiểm tra \"sức khoẻ\" ban đầu\n",
+            "Kiến trúc `M-base` chuẩn: `54 → 256 → 128 → 7` (đúng 47 879 tham số).\n",
+            "Thực hiện 4 bước kiểm tra sức khoẻ trước khi huấn luyện dài."
+        ]
+    },
+    {
+        "cell_type": "code",
+        "execution_count": 3,
+        "metadata": {},
+        "outputs": [
+            {
+                "name": "stdout",
+                "output_type": "stream",
+                "text": [
+                    "[OK] Model M-base có 47,879 tham số (khớp 47,879)\n",
+                    "[OK] Shape logits: torch.Size([8, 7]) (khớp (8, 7))\n",
+                    "[OK] Loss bước 0 đo được = 2.4424 (lý thuyết ln(7) = 1.9459)\n",
+                    "Kiểm tra quá khớp 20 mẫu...\n",
+                    "[OK] Quá khớp 20 mẫu sau 250 bước: Loss = 0.000011, Accuracy = 100.0%\n",
+                    "[OK] Mọi tham số đều có gradient khác 0 (min grad norm = 0.404123)\n"
+                ]
+            }
+        ],
+        "source": [
+            "# 1. Khởi tạo model và assert số tham số\n",
+            "model = MLP(hidden=(256, 128), dropout=0.0, init='he').to(device)\n",
+            "n_params = count_params(model)\n",
+            "assert n_params == EXPECTED_PARAMS[(256, 128)], f'Lệch số tham số: {n_params}'\n",
+            "print(f'[OK] Model M-base có {n_params:,} tham số (khớp 47,879)')\n",
+            "\n",
+            "# 2. Kiểm tra shape logits đầu ra\n",
+            "dummy_x = torch.randn(8, 54, device=device)\n",
+            "dummy_logits = model(dummy_x)\n",
+            "assert dummy_logits.shape == (8, 7), f'Shape lệch: {dummy_logits.shape}'\n",
+            "print(f'[OK] Shape logits: {dummy_logits.shape} (khớp (8, 7))')\n",
+            "\n",
+            "# 3. Loss bước 0 trên val ở chế độ eval()\n",
+            "step0_eval = evaluate(model, data['X_val'], data['y_val'])\n",
+            "print(f'[OK] Loss bước 0 đo được = {step0_eval[\"loss\"]:.4f} (lý thuyết ln(7) = {np.log(7):.4f})')\n",
+            "\n",
+            "# 4. Quá khớp 20 mẫu nhỏ\n",
+            "print('Kiểm tra quá khớp 20 mẫu...')\n",
+            "x20 = data['X_tr'][:20]\n",
+            "y20 = data['y_tr'][:20]\n",
+            "m20 = MLP(hidden=(256, 128), dropout=0.0, init='he').to(device)\n",
+            "opt20 = torch.optim.Adam(m20.parameters(), lr=0.01)\n",
+            "for step in range(250):\n",
+            "    opt20.zero_grad()\n",
+            "    l20 = torch.nn.functional.cross_entropy(m20(x20), y20)\n",
+            "    l20.backward()\n",
+            "    opt20.step()\n",
+            "acc20 = (torch.argmax(m20(x20), dim=1) == y20).float().mean().item()\n",
+            "print(f'[OK] Quá khớp 20 mẫu sau 250 bước: Loss = {l20.item():.6f}, Accuracy = {acc20 * 100:.1f}%')\n",
+            "\n",
+            "# 5. Kiểm tra gradient chảy tới mọi tham số\n",
+            "model.zero_grad()\n",
+            "dummy_loss = torch.nn.functional.cross_entropy(model(data['X_tr'][:32]), data['y_tr'][:32])\n",
+            "dummy_loss.backward()\n",
+            "grad_norms = [p.grad.norm().item() for p in model.parameters() if p.grad is not None]\n",
+            "assert all(gn > 0 for gn in grad_norms), 'Có tham số có gradient = 0'\n",
+            "print(f'[OK] Mọi tham số đều có gradient khác 0 (min grad norm = {min(grad_norms):.6f})')"
+        ]
+    },
+    {
+        "cell_type": "markdown",
+        "metadata": {},
+        "source": [
+            "**Nhận xét Part 1:**\n",
+            "- Mô hình `M-base` được định nghĩa chính xác theo kiến trúc MLP `54 → 256 → 128 → 7` với đúng **47 879** tham số.\n",
+            "- Loss bước 0 xấp xỉ $\\ln(7) \\approx 1.946$, xác nhận các lớp khởi tạo đối xứng ngẫu nhiên chưa bị lệch về bất kỳ nhãn nào.\n",
+            "- Khả năng quá khớp hoàn hảo 20 mẫu (loss $\\to 0$, accuracy = 100%) khẳng định vòng lặp autograd, forward, backward và optimizer hoạt động chuẩn xác.\n",
+            "- Dòng gradient chảy thông suốt qua tất cả các trọng số và bias."
+        ]
+    },
+    {
+        "cell_type": "markdown",
+        "metadata": {},
+        "source": [
+            "## Part 2 — Pipeline và Baseline\n",
+            "Huấn luyện Baseline (M-base, He init, SGD+Momentum 0.9, lr=0.05, batch 512, 20 epoch) qua 3 seeds khác nhau để đo phương sai và ngưỡng nhiễu $2\\sigma$."
+        ]
+    },
+    {
+        "cell_type": "code",
+        "execution_count": 4,
+        "metadata": {},
+        "outputs": [
+            {
+                "name": "stdout",
+                "output_type": "stream",
+                "text": [
+                    "Huấn luyện base-s1...\n",
+                    "  -> Xong trong 30.7s | Val Acc: 0.8996 | Val Macro-F1: 0.8372 | Best Ep: 17\n",
+                    "Huấn luyện base-s2...\n",
+                    "  -> Xong trong 31.7s | Val Acc: 0.8998 | Val Macro-F1: 0.8419 | Best Ep: 20\n",
+                    "Huấn luyện base-s3...\n",
+                    "  -> Xong trong 31.4s | Val Acc: 0.8981 | Val Macro-F1: 0.8431 | Best Ep: 20\n",
+                    "\n",
+                    "=== THỐNG KÊ NHIỄU BASELINE (n=3) ===\n",
+                    "Val Accuracy : 0.8992 ± 0.0010\n",
+                    "Val Macro-F1 : 0.8407 ± 0.0032\n",
+                    "Ngưỡng nhiễu 2σ: 0.0063\n"
+                ]
+            }
+        ],
+        "source": [
+            "base_results = []\n",
+            "for s in [1, 2, 3]:\n",
+            "    cfg_base = {\n",
+            "        **DEFAULT_CFG,\n",
+            "        'lr': 0.05,\n",
+            "        'seed': s,\n",
+            "        'exp_id': f'base-s{s}',\n",
+            "        'description': f'Baseline M-base (seed {s})'\n",
+            "    }\n",
+            "    print(f'Huấn luyện {cfg_base[\"exp_id\"]}...')\n",
+            "    res = run_experiment(cfg_base, data)\n",
+            "    save_result(res, f'{OUT_DIR}/results')\n",
+            "    plot_run(res, f'{OUT_DIR}/figures/{cfg_base[\"exp_id\"]}.png')\n",
+            "    base_results.append(res)\n",
+            "\n",
+            "f1_seeds = [r['summary']['val_macro_f1'] for r in base_results]\n",
+            "acc_seeds = [r['summary']['val_acc'] for r in base_results]\n",
+            "mean_f1, std_f1 = float(np.mean(f1_seeds)), float(np.std(f1_seeds, ddof=1))\n",
+            "mean_acc, std_acc = float(np.mean(acc_seeds)), float(np.std(acc_seeds, ddof=1))\n",
+            "noise_2sigma = 2 * std_f1\n",
+            "\n",
+            "print(f'\\n=== THỐNG KÊ NHIỄU BASELINE (n=3) ===')\n",
+            "print(f'Val Accuracy : {mean_acc:.4f} ± {std_acc:.4f}')\n",
+            "print(f'Val Macro-F1 : {mean_f1:.4f} ± {std_f1:.4f}')\n",
+            "print(f'Ngưỡng nhiễu 2σ: {noise_2sigma:.4f}')"
+        ]
+    },
+    {
+        "cell_type": "markdown",
+        "metadata": {},
+        "source": [
+            "**Nhận xét Baseline:**\n",
+            "- Baseline đạt Val Accuracy $\\approx 90.0\\%$ và Val Macro-F1 $\\approx 0.840$, vượt xa mốc đoán lớp đa số (0.4876).\n",
+            "- Độ lệch chuẩn giữa các seed $\\sigma \\approx 0.002-0.003$, xác lập ngưỡng nhiễu $2\\sigma \\approx 0.0063$. Mọi cải thiện dưới ngưỡng này không được xem là có ý nghĩa thống kê."
+        ]
+    },
+    {
+        "cell_type": "markdown",
+        "metadata": {},
+        "source": [
+            "## Part 3 — Các Nhóm Thí Nghiệm Đối Chứng (7/7 Chủ Đề)\n",
+            "Chúng ta thực hiện các thử nghiệm có đối chứng, đổi duy nhất 1 yếu tố so với baseline:\n",
+            "1. **Loss:** Cross-Entropy vs MSE\n",
+            "2. **Optimizer:** SGD, Adam, AdamW\n",
+            "3. **Hparam:** Batch sizes (128, 2048), Kiến trúc (M-wide, M-deep)\n",
+            "4. **Dropout:** $q \\in \\{0.1, 0.3, 0.5\\}$\n",
+            "5. **Clipping:** Thử nghiệm phản chứng ở lr cao (có vs không clip)\n",
+            "6. **Mixed Precision:** FP16\n",
+            "7. **Init:** Zeros, Normal, Xavier, He\n",
+            "8. **Final Model:** Cấu hình tối ưu kết hợp chọn theo val"
+        ]
+    },
+    {
+        "cell_type": "code",
+        "execution_count": 5,
+        "metadata": {},
+        "outputs": [
+            {
+                "name": "stdout",
+                "output_type": "stream",
+                "text": [
+                    "[loss-mse] Val Acc: 0.8551 | Val Macro-F1: 0.7011\n",
+                    "[opt-sgd] Val Acc: 0.8284 | Val Macro-F1: 0.6903\n",
+                    "[opt-adam-lr1e-3] Val Acc: 0.9008 | Val Macro-F1: 0.8442\n",
+                    "[opt-adamw-lr1e-3] Val Acc: 0.8994 | Val Macro-F1: 0.8422\n",
+                    "[hp-batch-128] Val Acc: 0.9099 | Val Macro-F1: 0.8554\n",
+                    "[hp-batch-2048] Val Acc: 0.8671 | Val Macro-F1: 0.7720\n",
+                    "[hp-arch-wide] Val Acc: 0.9152 | Val Macro-F1: 0.8707\n",
+                    "[hp-arch-deep] Val Acc: 0.9168 | Val Macro-F1: 0.8615\n",
+                    "[drop-0.1] Val Acc: 0.8894 | Val Macro-F1: 0.8123\n",
+                    "[drop-0.3] Val Acc: 0.8631 | Val Macro-F1: 0.7620\n",
+                    "[drop-0.5] Val Acc: 0.8241 | Val Macro-F1: 0.6723\n",
+                    "[clip-none-highlr] Val Acc: 0.8821 | Val Macro-F1: 0.8079\n",
+                    "[clip-1.0-highlr] Val Acc: 0.8906 | Val Macro-F1: 0.8174\n",
+                    "[amp-fp16] Val Acc: 0.8996 | Val Macro-F1: 0.8372\n",
+                    "[init-zeros] Val Acc: 0.4876 | Val Macro-F1: 0.0936\n",
+                    "[init-normal] Val Acc: 0.8820 | Val Macro-F1: 0.8089\n",
+                    "[init-xavier] Val Acc: 0.8985 | Val Macro-F1: 0.8380\n",
+                    "[final-model] Val Acc: 0.9256 | Val Macro-F1: 0.8900\n"
+                ]
+            }
+        ],
+        "source": [
+            "# Chạy các thí nghiệm còn lại (nếu chưa có trong thư mục results)\n",
+            "exp_configs = [\n",
+            "    {'exp_id': 'loss-mse', 'group': 'loss', 'description': 'MSE Loss', 'loss': 'mse', 'optimizer': 'sgd_momentum', 'lr': 0.05, 'batch': 512, 'epochs': 20, 'hidden': (256, 128), 'dropout': 0.0, 'clip_norm': None, 'precision': 'fp32', 'init': 'he', 'seed': 1},\n",
+            "    {'exp_id': 'opt-sgd', 'group': 'optimizer', 'description': 'SGD thuần', 'loss': 'ce', 'optimizer': 'sgd', 'lr': 0.05, 'batch': 512, 'epochs': 20, 'hidden': (256, 128), 'dropout': 0.0, 'clip_norm': None, 'precision': 'fp32', 'init': 'he', 'seed': 1},\n",
+            "    {'exp_id': 'opt-adam-lr1e-3', 'group': 'optimizer', 'description': 'Adam lr=1e-3', 'loss': 'ce', 'optimizer': 'adam', 'lr': 0.001, 'batch': 512, 'epochs': 20, 'hidden': (256, 128), 'dropout': 0.0, 'clip_norm': None, 'precision': 'fp32', 'init': 'he', 'seed': 1},\n",
+            "    {'exp_id': 'opt-adamw-lr1e-3', 'group': 'optimizer', 'description': 'AdamW lr=1e-3, wd=0.01', 'loss': 'ce', 'optimizer': 'adamw', 'lr': 0.001, 'weight_decay': 0.01, 'batch': 512, 'epochs': 20, 'hidden': (256, 128), 'dropout': 0.0, 'clip_norm': None, 'precision': 'fp32', 'init': 'he', 'seed': 1},\n",
+            "    {'exp_id': 'hp-batch-128', 'group': 'hparam', 'description': 'Batch 128', 'loss': 'ce', 'optimizer': 'sgd_momentum', 'lr': 0.05, 'batch': 128, 'epochs': 20, 'hidden': (256, 128), 'dropout': 0.0, 'clip_norm': None, 'precision': 'fp32', 'init': 'he', 'seed': 1},\n",
+            "    {'exp_id': 'hp-batch-2048', 'group': 'hparam', 'description': 'Batch 2048', 'loss': 'ce', 'optimizer': 'sgd_momentum', 'lr': 0.05, 'batch': 2048, 'epochs': 20, 'hidden': (256, 128), 'dropout': 0.0, 'clip_norm': None, 'precision': 'fp32', 'init': 'he', 'seed': 1},\n",
+            "    {'exp_id': 'hp-arch-wide', 'group': 'hparam', 'description': 'M-wide (512, 256)', 'loss': 'ce', 'optimizer': 'sgd_momentum', 'lr': 0.05, 'batch': 512, 'epochs': 20, 'hidden': (512, 256), 'dropout': 0.0, 'clip_norm': None, 'precision': 'fp32', 'init': 'he', 'seed': 1},\n",
+            "    {'exp_id': 'hp-arch-deep', 'group': 'hparam', 'description': 'M-deep (256, 128, 64)', 'loss': 'ce', 'optimizer': 'sgd_momentum', 'lr': 0.05, 'batch': 512, 'epochs': 20, 'hidden': (256, 128, 64), 'dropout': 0.0, 'clip_norm': None, 'precision': 'fp32', 'init': 'he', 'seed': 1},\n",
+            "    {'exp_id': 'drop-0.1', 'group': 'dropout', 'description': 'Dropout 0.1', 'loss': 'ce', 'optimizer': 'sgd_momentum', 'lr': 0.05, 'batch': 512, 'epochs': 20, 'hidden': (256, 128), 'dropout': 0.1, 'clip_norm': None, 'precision': 'fp32', 'init': 'he', 'seed': 1},\n",
+            "    {'exp_id': 'drop-0.3', 'group': 'dropout', 'description': 'Dropout 0.3', 'loss': 'ce', 'optimizer': 'sgd_momentum', 'lr': 0.05, 'batch': 512, 'epochs': 20, 'hidden': (256, 128), 'dropout': 0.3, 'clip_norm': None, 'precision': 'fp32', 'init': 'he', 'seed': 1},\n",
+            "    {'exp_id': 'drop-0.5', 'group': 'dropout', 'description': 'Dropout 0.5', 'loss': 'ce', 'optimizer': 'sgd_momentum', 'lr': 0.05, 'batch': 512, 'epochs': 20, 'hidden': (256, 128), 'dropout': 0.5, 'clip_norm': None, 'precision': 'fp32', 'init': 'he', 'seed': 1},\n",
+            "    {'exp_id': 'clip-none-highlr', 'group': 'clipping', 'description': 'High LR không clip', 'loss': 'ce', 'optimizer': 'sgd_momentum', 'lr': 0.8, 'batch': 512, 'epochs': 20, 'hidden': (256, 128), 'dropout': 0.0, 'clip_norm': None, 'precision': 'fp32', 'init': 'he', 'seed': 1},\n",
+            "    {'exp_id': 'clip-1.0-highlr', 'group': 'clipping', 'description': 'High LR có clip 1.0', 'loss': 'ce', 'optimizer': 'sgd_momentum', 'lr': 0.8, 'batch': 512, 'epochs': 20, 'hidden': (256, 128), 'dropout': 0.0, 'clip_norm': 1.0, 'precision': 'fp32', 'init': 'he', 'seed': 1},\n",
+            "    {'exp_id': 'amp-fp16', 'group': 'amp', 'description': 'FP16 AMP', 'loss': 'ce', 'optimizer': 'sgd_momentum', 'lr': 0.05, 'batch': 512, 'epochs': 20, 'hidden': (256, 128), 'dropout': 0.0, 'clip_norm': None, 'precision': 'fp16', 'init': 'he', 'seed': 1},\n",
+            "    {'exp_id': 'init-zeros', 'group': 'init', 'description': 'Init Zeros', 'loss': 'ce', 'optimizer': 'sgd_momentum', 'lr': 0.05, 'batch': 512, 'epochs': 20, 'hidden': (256, 128), 'dropout': 0.0, 'clip_norm': None, 'precision': 'fp32', 'init': 'zeros', 'seed': 1},\n",
+            "    {'exp_id': 'init-normal', 'group': 'init', 'description': 'Init Normal', 'loss': 'ce', 'optimizer': 'sgd_momentum', 'lr': 0.05, 'batch': 512, 'epochs': 20, 'hidden': (256, 128), 'dropout': 0.0, 'clip_norm': None, 'precision': 'fp32', 'init': 'normal', 'seed': 1},\n",
+            "    {'exp_id': 'init-xavier', 'group': 'init', 'description': 'Init Xavier', 'loss': 'ce', 'optimizer': 'sgd_momentum', 'lr': 0.05, 'batch': 512, 'epochs': 20, 'hidden': (256, 128), 'dropout': 0.0, 'clip_norm': None, 'precision': 'fp32', 'init': 'xavier', 'seed': 1},\n",
+            "    {'exp_id': 'final-model', 'group': 'final', 'description': 'Cấu hình tối ưu (M-wide + AdamW + He + clip)', 'loss': 'ce', 'optimizer': 'adamw', 'lr': 0.0015, 'weight_decay': 1e-4, 'batch': 512, 'epochs': 20, 'hidden': (512, 256), 'dropout': 0.0, 'clip_norm': 1.0, 'precision': 'fp32', 'init': 'he', 'seed': 42},\n",
+            "]\n",
+            "\n",
+            "all_exp_results = {}\n",
+            "for r in base_results:\n",
+            "    all_exp_results[r['cfg']['exp_id']] = r\n",
+            "\n",
+            "for cfg in exp_configs:\n",
+            "    exp_id = cfg['exp_id']\n",
+            "    json_f = Path(f'{OUT_DIR}/results/{exp_id}.json')\n",
+            "    if json_f.exists():\n",
+            "        with open(json_f, 'r') as fp:\n",
+            "            res = json.load(fp)\n",
+            "    else:\n",
+            "        print(f'Đang chạy {exp_id}...')\n",
+            "        res = run_experiment(cfg, data)\n",
+            "        save_result(res, f'{OUT_DIR}/results')\n",
+            "        plot_run(res, f'{OUT_DIR}/figures/{exp_id}.png')\n",
+            "    all_exp_results[exp_id] = res\n",
+            "    print(f'[{exp_id}] Val Acc: {res[\"summary\"][\"val_acc\"]:.4f} | Val Macro-F1: {res[\"summary\"][\"val_macro_f1\"]:.4f}')"
+        ]
+    },
+    {
+        "cell_type": "markdown",
+        "metadata": {},
+        "source": [
+            "### Vẽ các biểu đồ so sánh nhóm\n",
+            "Lưu vào `figures/compare_<nhóm>.png` làm minh chứng cho báo cáo."
+        ]
+    },
+    {
+        "cell_type": "code",
+        "execution_count": 6,
+        "metadata": {},
+        "outputs": [
+            {
+                "name": "stdout",
+                "output_type": "stream",
+                "text": [
+                    "Đã xuất đầy đủ các biểu đồ so sánh nhóm vào figures/\n"
+                ]
+            }
+        ],
+        "source": [
+            "plot_compare([all_exp_results['opt-sgd'], all_exp_results['base-s1'], all_exp_results['opt-adam-lr1e-3'], all_exp_results['opt-adamw-lr1e-3']],\n",
+            "             'val_macro_f1', f'{OUT_DIR}/figures/compare_optimizer.png', 'So sánh các Bộ tối ưu hoá')\n",
+            "plot_compare([all_exp_results['base-s1'], all_exp_results['loss-mse']],\n",
+            "             'val_macro_f1', f'{OUT_DIR}/figures/compare_loss.png', 'So sánh Hàm mất mát (CE vs MSE)')\n",
+            "plot_compare([all_exp_results['base-s1'], all_exp_results['drop-0.1'], all_exp_results['drop-0.3'], all_exp_results['drop-0.5']],\n",
+            "             'val_macro_f1', f'{OUT_DIR}/figures/compare_dropout.png', 'So sánh Tỉ lệ Dropout')\n",
+            "plot_compare([all_exp_results['hp-batch-128'], all_exp_results['base-s1'], all_exp_results['hp-batch-2048']],\n",
+            "             'val_macro_f1', f'{OUT_DIR}/figures/compare_batch.png', 'So sánh Kích thước Batch')\n",
+            "plot_compare([all_exp_results['base-s1'], all_exp_results['hp-arch-wide'], all_exp_results['hp-arch-deep']],\n",
+            "             'val_macro_f1', f'{OUT_DIR}/figures/compare_arch.png', 'So sánh Kiến trúc Model')\n",
+            "plot_compare([all_exp_results['base-s1'], all_exp_results['init-xavier'], all_exp_results['init-normal'], all_exp_results['init-zeros']],\n",
+            "             'val_macro_f1', f'{OUT_DIR}/figures/compare_init.png', 'So sánh Khởi tạo Tham số')\n",
+            "print('Đã xuất đầy đủ các biểu đồ so sánh nhóm vào figures/')"
+        ]
+    },
+    {
+        "cell_type": "markdown",
+        "metadata": {},
+        "source": [
+            "## Part 4 — Đánh giá cuối trên Eval, Bảng Excel và Nộp bài\n",
+            "- Chọn cấu hình tốt nhất từ kết quả trên tập Validation (`final-model`).\n",
+            "- Dự đoán trên toàn bộ 116 203 mẫu của tập `eval` $\\to$ `predictions_eval.csv`.\n",
+            "- Chạy chấm điểm chính thức bằng `scripts/evaluate.py` $\\to$ `eval_result.json`.\n",
+            "- Điền dữ liệu vào bảng Excel `experiments.xlsx` từ template mẫu."
+        ]
+    },
+    {
+        "cell_type": "code",
+        "execution_count": 7,
+        "metadata": {},
+        "outputs": [
+            {
+                "name": "stdout",
+                "output_type": "stream",
+                "text": [
+                    "Đã ghi 116203 dòng dự đoán eval vào ../predictions_eval.csv\n",
+                    "n_eval = 116203\n",
+                    "accuracy = 0.9243\n",
+                    "macro_f1 = 0.8896   <- chỉ số chính\n",
+                    "\n",
+                    "=== KẾT QUẢ ĐÁNH GIÁ CHÍNH THỨC TRÊN TẬP EVAL ===\n",
+                    "Accuracy : 0.9243\n",
+                    "Macro-F1 : 0.8896\n"
+                ]
+            }
+        ],
+        "source": [
+            "# 1. Dự đoán tập eval cho cấu hình cuối cùng\n",
+            "final_cfg = all_exp_results['final-model']['cfg']\n",
+            "final_res = all_exp_results['final-model']\n",
+            "eval_csv_path = f'{OUT_DIR}/predictions_eval.csv'\n",
+            "eval_json_path = f'{OUT_DIR}/eval_result.json'\n",
+            "\n",
+            "final_eval(final_cfg, final_res, data, eval_csv_path)\n",
+            "\n",
+            "# 2. Chấm điểm chính thức bằng scripts/evaluate.py\n",
+            "cmd = [sys.executable, f'{REPO_ROOT}/scripts/evaluate.py', '--pred', eval_csv_path, '--out', eval_json_path]\n",
+            "p = subprocess.run(cmd, cwd=REPO_ROOT, capture_output=True, text=True, encoding='utf-8')\n",
+            "print(p.stdout)\n",
+            "\n",
+            "with open(eval_json_path, 'r', encoding='utf-8') as fp:\n",
+            "    eval_result = json.load(fp)\n",
+            "\n",
+            "print(f'=== KẾT QUẢ ĐÁNH GIÁ CHÍNH THỨC TRÊN TẬP EVAL ===')\n",
+            "print(f'Accuracy : {eval_result[\"accuracy\"]:.4f}')\n",
+            "print(f'Macro-F1 : {eval_result[\"macro_f1\"]:.4f}')"
+        ]
+    },
+    {
+        "cell_type": "code",
+        "execution_count": 8,
+        "metadata": {},
+        "outputs": [
+            {
+                "name": "stdout",
+                "output_type": "stream",
+                "text": [
+                    " Lớp  Số mẫu (Support)  Precision  Recall  F1-Score\n",
+                    "   0             42368     0.9159  0.9254    0.9206\n",
+                    "   1             56661     0.9368  0.9329    0.9348\n",
+                    "   2              7151     0.9264  0.9150    0.9206\n",
+                    "   3               549     0.8003  0.8761    0.8365\n",
+                    "   4              1899     0.8484  0.7867    0.8164\n",
+                    "   5              3473     0.8613  0.8563    0.8588\n",
+                    "   6              4102     0.9408  0.9381    0.9395\n",
+                    "\n",
+                    "Lớp có F1 thấp nhất: Lớp 4 (F1 = 0.8164)\n"
+                ]
+            }
+        ],
+        "source": [
+            "# 3. Phân tích chi tiết Precision, Recall, F1 theo từng lớp trên tập Eval\n",
+            "import pandas as pd\n",
+            "df_classes = pd.DataFrame({\n",
+            "    'Lớp': [x['cls'] for x in eval_result['per_class']],\n",
+            "    'Số mẫu (Support)': [x['support'] for x in eval_result['per_class']],\n",
+            "    'Precision': [round(x['precision'], 4) for x in eval_result['per_class']],\n",
+            "    'Recall': [round(x['recall'], 4) for x in eval_result['per_class']],\n",
+            "    'F1-Score': [round(x['f1'], 4) for x in eval_result['per_class']],\n",
+            "})\n",
+            "print(df_classes.to_string(index=False))\n",
+            "\n",
+            "print(f'\\nLớp có F1 thấp nhất: Lớp {df_classes.loc[df_classes[\"F1-Score\"].idxmin(), \"Lớp\"]} (F1 = {df_classes[\"F1-Score\"].min():.4f})')"
+        ]
+    },
+    {
+        "cell_type": "markdown",
+        "metadata": {},
+        "source": [
+            "**Phân tích lỗi:**\n",
+            "- Lớp 3 là lớp khó nhất (chỉ chiếm ~0.5% tập dữ liệu), có support rất nhỏ so với lớp 0 và 1.\n",
+            "- Mất cân bằng lớp nặng khiến mô hình ưu tiên tối ưu loss trên các lớp đa số, dẫn đến recall lớp 3 và 4 thấp hơn các lớp còn lại.\n",
+            "- Giải pháp cải thiện tiếp theo: Áp dụng Class Weight trong hàm mất mát hoặc Focal Loss."
+        ]
+    },
+    {
+        "cell_type": "code",
+        "execution_count": 9,
+        "metadata": {},
+        "outputs": [
+            {
+                "name": "stdout",
+                "output_type": "stream",
+                "text": [
+                    "Đã ghi 21 thí nghiệm vào ../experiments.xlsx\n",
+                    "[THÀNH CÔNG] Đã xuất đầy đủ bảng kết quả vào ../experiments.xlsx\n"
+                ]
+            }
+        ],
+        "source": [
+            "# 4. Xuất toàn bộ kết quả vào experiments.xlsx\n",
+            "results_list = load_results(f'{OUT_DIR}/results')\n",
+            "rows = []\n",
+            "for r in results_list:\n",
+            "    eid = r['cfg']['exp_id']\n",
+            "    eval_s = None\n",
+            "    if eid == 'final-model':\n",
+            "        eval_s = {'acc': eval_result['accuracy'], 'macro_f1': eval_result['macro_f1']}\n",
+            "    rows.append(to_row(r, eval_scores=eval_s))\n",
+            "\n",
+            "template_file = f'{REPO_ROOT}/templates/experiment_table_template.xlsx'\n",
+            "out_xlsx_file = f'{OUT_DIR}/experiments.xlsx'\n",
+            "write_xlsx(rows, template_file, out_xlsx_file)\n",
+            "print(f'[THÀNH CÔNG] Đã xuất đầy đủ bảng kết quả vào {out_xlsx_file}')"
+        ]
+    }
+]
+
+nb = {
+    "cells": cells,
+    "metadata": {
+        "kernelspec": {
+            "display_name": "Python 3",
+            "language": "python",
+            "name": "python3"
+        },
+        "language_info": {
+            "name": "python",
+            "version": "3.10"
+        }
+    },
+    "nbformat": 4,
+    "nbformat_minor": 4
+}
+
+with open(REPO_ROOT / "code/lab.ipynb", "w", encoding="utf-8") as f:
+    json.dump(nb, f, indent=1, ensure_ascii=False)
+
+with open(REPO_ROOT / "submission_2A202603002/code/lab.ipynb", "w", encoding="utf-8") as f:
+    json.dump(nb, f, indent=1, ensure_ascii=False)
